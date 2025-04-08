@@ -36,7 +36,7 @@
           "importance" : "normal",
           "token" : 1000000000000012926
         },
-        "objectName" : "keycloak"
+        "objectName" : "service"
       }, {
         "objectDelta" : {
           "changeType" : "modify",

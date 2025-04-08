@@ -264,9 +264,9 @@ func loadJSONFromFile(filePath string) (map[string]interface{}, error) {
 
 func TestFilterKeys(t *testing.T) {
 	// Load test data from files
-	serviceMidpointJSON, err := loadJSONFromFile("/Users/jplana/src/terraform-provider-midpoint-restapi/service_from_midpoint.json")
+	serviceMidpointJSON, err := loadJSONFromFile("testdata/service_from_midpoint.json")
 	if err != nil {
-		t.Fatalf("filter_keys_test.go: Failed to load service_from_midpoint.json: %s", err)
+		t.Fatalf("filter_keys_test.go: Failed to load testdata/service_from_midpoint.json: %s", err)
 	}
 
 	// Extract service ID
