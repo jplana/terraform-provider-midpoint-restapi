@@ -23,3 +23,4 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Maintain backward compatibility when possible
 - Test with the fakeserver CLI tool for API interactions
 - Follow the provider pattern established in the codebase
+- Pull request should be made to the jplana/terraform-provider-midpoint-restapi never to the original repository
