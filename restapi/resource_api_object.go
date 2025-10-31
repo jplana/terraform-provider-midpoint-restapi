@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -100,6 +101,7 @@ func resourceRestAPI() *schema.Resource {
 					}
 					return warns, errs
 				},
+				DiffSuppressFunc: suppressDiffForIgnoredFields,
 			},
 			"debug": {
 				Type:        schema.TypeBool,
@@ -325,19 +327,35 @@ func resourceRestAPIRead(d *schema.ResourceData, meta interface{}) error {
 				}
 			}
 
+			// Filter ignored fields from state data before comparison
+			// This ensures obj.data doesn't contain server-managed fields
+			stateData := obj.data
+			if len(ignoreList) > 0 {
+				stateData = filterIgnoredFields(obj.data, ignoreList)
+			}
+
 			// This checks if there were any changes to the remote resource that will need to be corrected
-			// by comparing the current state with the response returned by the api.
-			modifiedResource, hasDifferences := getDelta(obj.data, obj.apiData, ignoreList)
+			// by comparing the filtered state with the response returned by the api.
+			_, hasDifferences := getDelta(stateData, obj.apiData, ignoreList)
 
 			if hasDifferences {
 				log.Printf("resource_api_object.go: Found differences in remote resource\n")
-				encoded, err := json.Marshal(modifiedResource)
-				if err != nil {
-					return err
-				}
-				jsonString := string(encoded)
-				d.Set("data", jsonString)
 			}
+
+			// Always store the filtered API data in state (what's currently in the API)
+			// This ensures state reflects reality, minus the ignored fields
+			dataToStore := obj.apiData
+			if len(ignoreList) > 0 {
+				dataToStore = filterIgnoredFields(obj.apiData, ignoreList)
+			}
+
+			// Store the filtered resource in state
+			encoded, err := json.Marshal(dataToStore)
+			if err != nil {
+				return err
+			}
+			jsonString := string(encoded)
+			d.Set("data", jsonString)
 		}
 
 	}
@@ -363,6 +381,55 @@ func resourceRestAPIUpdate(d *schema.ResourceData, meta interface{}) error {
 
 	if obj.debug {
 		log.Printf("resource_api_object.go: Update routine called. Object built:\n%s\n", obj.toString())
+	}
+
+	// For PATCH method, get the ignore list and set it on the object
+	if obj.updateMethod == "PATCH" && !(d.Get("ignore_all_server_changes")).(bool) {
+		// Get the ignore list from schema
+		ignoreList := []string{}
+		v, ok := d.GetOk("ignore_changes_to")
+		if ok {
+			for _, s := range v.([]interface{}) {
+				ignoreList = append(ignoreList, s.(string))
+			}
+		}
+
+		// Set the ignore list on the object so patchMidpointObject can use it
+		obj.ignoreChangesTo = ignoreList
+
+		// If we have an ignore list, check if there are real changes
+		if len(ignoreList) > 0 {
+			// Read current state from API to compare
+			err = obj.readObject()
+			if err != nil {
+				d.Partial(true)
+				return fmt.Errorf("failed to read object for change detection: %v", err)
+			}
+
+			// Check if there are real changes after filtering ignored fields
+			modifiedData, hasChanges := getDelta(obj.data, obj.apiData, ignoreList)
+
+			if obj.debug {
+				log.Printf("resource_api_object.go: Change detection: hasChanges=%v", hasChanges)
+				if hasChanges {
+					modifiedJSON, _ := json.Marshal(modifiedData)
+					log.Printf("resource_api_object.go: Modified fields: %s", string(modifiedJSON))
+				}
+			}
+
+			if !hasChanges {
+				if obj.debug {
+					log.Printf("resource_api_object.go: No real changes detected after filtering ignored fields, skipping PATCH")
+				}
+				// No real changes, just update state without sending PATCH
+				setResourceState(obj, d)
+				return nil
+			}
+
+			if obj.debug {
+				log.Printf("resource_api_object.go: Real changes detected, proceeding with PATCH")
+			}
+		}
 	}
 
 	err = obj.updateObject()
@@ -507,7 +574,131 @@ func buildAPIObjectOpts(d *schema.ResourceData) (*apiObjectOpts, error) {
 	opts.data = d.Get("data").(string)
 	opts.debug = d.Get("debug").(bool)
 
+	// Filter ignored fields from the data at load time
+	// This ensures Terraform never sees server-managed fields even if they're in the config file
+	if v, ok := d.GetOk("ignore_changes_to"); ok {
+		ignoreList := []string{}
+		for _, s := range v.([]interface{}) {
+			ignoreList = append(ignoreList, s.(string))
+		}
+
+		if len(ignoreList) > 0 && opts.data != "" {
+			// Parse the JSON data
+			var dataMap map[string]interface{}
+			err := json.Unmarshal([]byte(opts.data), &dataMap)
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse data JSON for filtering: %v", err)
+			}
+
+			// Filter ignored fields
+			filteredData := filterIgnoredFields(dataMap, ignoreList)
+
+			// Only re-serialize if filtering actually changed something
+			// This preserves original JSON formatting when no filtering is needed
+			originalJSON, _ := json.Marshal(dataMap)
+			filteredJSON, err := json.Marshal(filteredData)
+			if err != nil {
+				return nil, fmt.Errorf("failed to serialize filtered data: %v", err)
+			}
+
+			// Only update if something changed
+			if string(originalJSON) != string(filteredJSON) {
+				opts.data = string(filteredJSON)
+				if opts.debug {
+					log.Printf("resource_api_object.go: Filtered ignored fields from config data")
+				}
+			}
+		}
+	}
+
 	return opts, nil
+}
+
+// getIgnoreList extracts the ignore_changes_to list from ResourceData
+func getIgnoreList(d interface{}) []string {
+	ignoreList := []string{}
+
+	// Handle both *schema.ResourceData and *schema.ResourceDiff
+	var raw interface{}
+
+	switch v := d.(type) {
+	case *schema.ResourceData:
+		// Use Get instead of GetOk to get the value from config, not just state
+		raw = v.Get("ignore_changes_to")
+	case *schema.ResourceDiff:
+		raw = v.Get("ignore_changes_to")
+	default:
+		return ignoreList
+	}
+
+	// Check if raw is nil or not a list
+	if raw == nil {
+		return ignoreList
+	}
+
+	// Type assert to []interface{}
+	rawList, ok := raw.([]interface{})
+	if !ok {
+		return ignoreList
+	}
+
+	for _, s := range rawList {
+		if str, ok := s.(string); ok {
+			ignoreList = append(ignoreList, str)
+		}
+	}
+
+	return ignoreList
+}
+
+// suppressDiffForIgnoredFields compares old (state) vs new (config) JSON,
+// ignoring fields specified in ignore_changes_to.
+// Also handles JSON normalization to suppress diffs caused by whitespace differences.
+// Returns true if the only differences are in ignored fields or formatting (suppress diff).
+func suppressDiffForIgnoredFields(k, old, new string, d *schema.ResourceData) bool {
+	// Get ignore list
+	ignoreList := getIgnoreList(d)
+
+	debug := false
+	if v, ok := d.GetOk("debug"); ok {
+		debug = v.(bool)
+	}
+
+	// If old is empty (new resource), don't suppress
+	if old == "" || old == "{}" {
+		return false
+	}
+
+	// Parse old (state) and new (config) JSON
+	var oldData, newData map[string]interface{}
+
+	if err := json.Unmarshal([]byte(old), &oldData); err != nil {
+		// Can't parse old state - don't suppress (let Terraform show the diff)
+		log.Printf("resource_api_object.go: DiffSuppressFunc: failed to parse old state: %v", err)
+		return false
+	}
+
+	if err := json.Unmarshal([]byte(new), &newData); err != nil {
+		// Can't parse new config - don't suppress
+		log.Printf("resource_api_object.go: DiffSuppressFunc: failed to parse new config: %v", err)
+		return false
+	}
+
+	// If there's an ignore list, filter both old and new before comparing
+	if len(ignoreList) > 0 {
+		oldData = filterIgnoredFields(oldData, ignoreList)
+		newData = filterIgnoredFields(newData, ignoreList)
+	}
+
+	// Compare the JSON structures (this handles whitespace normalization)
+	// If they're equal after parsing, suppress the diff
+	result := reflect.DeepEqual(oldData, newData)
+
+	if debug && len(ignoreList) > 0 {
+		log.Printf("resource_api_object.go: DiffSuppressFunc returning %v (suppress=%v)", result, result)
+	}
+
+	return result
 }
 
 func expandReadSearch(v map[string]interface{}) (readSearch map[string]string) {

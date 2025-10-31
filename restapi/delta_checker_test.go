@@ -256,6 +256,79 @@ var deltaTestCases = []deltaTestCase{
 		ignoreList:     []string{},
 		resultHasDelta: true,
 	},
+
+	// Wildcard pattern tests - new syntax
+	{
+		testCase:       "Wildcard pattern ignores field at root level",
+		o1:             MapAny{"metadata": "v1"},
+		o2:             MapAny{"metadata": "v2"},
+		ignoreList:     []string{"*.metadata"},
+		resultHasDelta: false,
+	},
+
+	{
+		testCase:       "Wildcard pattern ignores field at nested level",
+		o1:             MapAny{"outer": MapAny{"metadata": "v1"}},
+		o2:             MapAny{"outer": MapAny{"metadata": "v2"}},
+		ignoreList:     []string{"*.metadata"},
+		resultHasDelta: false,
+	},
+
+	{
+		testCase:       "Wildcard pattern ignores field at multiple levels",
+		o1:             MapAny{"metadata": "v1", "outer": MapAny{"metadata": "v1", "inner": MapAny{"metadata": "v1"}}},
+		o2:             MapAny{"metadata": "v2", "outer": MapAny{"metadata": "v2", "inner": MapAny{"metadata": "v2"}}},
+		ignoreList:     []string{"*.metadata"},
+		resultHasDelta: false,
+	},
+
+	{
+		testCase:       "Simple key only matches at root level (not nested)",
+		o1:             MapAny{"metadata": "v1", "outer": MapAny{"metadata": "v1"}},
+		o2:             MapAny{"metadata": "v1", "outer": MapAny{"metadata": "v2"}},
+		ignoreList:     []string{"metadata"},
+		resultHasDelta: true, // Should detect change in outer.metadata
+	},
+
+	{
+		testCase:       "Simple key matches at root level only",
+		o1:             MapAny{"metadata": "v1", "outer": MapAny{"foo": "bar"}},
+		o2:             MapAny{"metadata": "v2", "outer": MapAny{"foo": "bar"}},
+		ignoreList:     []string{"metadata"},
+		resultHasDelta: false, // Should ignore change at root
+	},
+
+	{
+		testCase:       "Dotted path matches specific path only",
+		o1:             MapAny{"outer": MapAny{"metadata": "v1"}, "metadata": "v1"},
+		o2:             MapAny{"outer": MapAny{"metadata": "v2"}, "metadata": "v2"},
+		ignoreList:     []string{"outer.metadata"},
+		resultHasDelta: true, // Should detect change in root metadata
+	},
+
+	{
+		testCase:       "Mixed patterns - wildcard and specific path",
+		o1:             MapAny{"id": "1", "outer": MapAny{"id": "2", "metadata": "v1"}},
+		o2:             MapAny{"id": "1", "outer": MapAny{"id": "3", "metadata": "v2"}},
+		ignoreList:     []string{"*.id", "outer.metadata"},
+		resultHasDelta: false,
+	},
+
+	{
+		testCase:       "Wildcard in deeply nested structure",
+		o1:             MapAny{"a": MapAny{"b": MapAny{"c": MapAny{"version": "1"}}}},
+		o2:             MapAny{"a": MapAny{"b": MapAny{"c": MapAny{"version": "2"}}}},
+		ignoreList:     []string{"*.version"},
+		resultHasDelta: false,
+	},
+
+	{
+		testCase:       "Wildcard with array of objects",
+		o1:             MapAny{"items": []MapAny{{"id": "1", "name": "a"}, {"id": "2", "name": "b"}}},
+		o2:             MapAny{"items": []MapAny{{"id": "10", "name": "a"}, {"id": "20", "name": "b"}}},
+		ignoreList:     []string{"*.id"},
+		resultHasDelta: false,
+	},
 }
 
 /*

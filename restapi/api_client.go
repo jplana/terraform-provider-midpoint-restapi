@@ -285,6 +285,15 @@ func (client *APIClient) sendRequest(method string, path string, data string) (s
 		}
 	}
 
+	if client.debug {
+		log.Printf("api_client.go: Request headers:")
+		for name, values := range req.Header {
+			for _, value := range values {
+				log.Printf("api_client.go:   %s: %s", name, value)
+			}
+		}
+	}
+
 	if client.oauthConfig != nil {
 		ctx := context.WithValue(context.Background(), oauth2.HTTPClient, client.httpClient)
 		tokenSource := client.oauthConfig.TokenSource(ctx)

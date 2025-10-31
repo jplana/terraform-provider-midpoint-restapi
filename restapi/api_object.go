@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"reflect"
 	"strings"
+	"time"
 
 	"github.com/davecgh/go-spew/spew"
 )
@@ -52,12 +54,13 @@ type APIObject struct {
 	idAttribute   string
 
 	/* Set internally */
-	data        map[string]interface{} /* Data as managed by the user */
-	readData    map[string]interface{} /* Read data as managed by the user */
-	updateData  map[string]interface{} /* Update data as managed by the user */
-	destroyData map[string]interface{} /* Destroy data as managed by the user */
-	apiData     map[string]interface{} /* Data as available from the API */
-	apiResponse string
+	data            map[string]interface{} /* Data as managed by the user */
+	readData        map[string]interface{} /* Read data as managed by the user */
+	updateData      map[string]interface{} /* Update data as managed by the user */
+	destroyData     map[string]interface{} /* Destroy data as managed by the user */
+	apiData         map[string]interface{} /* Data as available from the API */
+	apiResponse     string
+	ignoreChangesTo []string /* Fields to ignore when detecting changes */
 }
 
 // NewAPIObject makes an APIobject to manage a RESTful object in an API
@@ -289,7 +292,16 @@ func (obj *APIObject) createObject() error {
 		return fmt.Errorf("provided object does not have an id set and the client is not configured to read the object from a POST or PUT response; please set write_returns_object to true, or include an id in the object's data")
 	}
 
-	b, _ := json.Marshal(obj.data)
+	// Filter ignored fields from the data before sending
+	dataToSend := obj.data
+	if len(obj.ignoreChangesTo) > 0 {
+		dataToSend = filterIgnoredFields(obj.data, obj.ignoreChangesTo)
+		if obj.debug {
+			log.Printf("api_object.go: Filtered ignored fields for CREATE operation")
+		}
+	}
+
+	b, _ := json.Marshal(dataToSend)
 
 	postPath := obj.postPath
 	if obj.queryString != "" {
@@ -400,12 +412,38 @@ func (obj *APIObject) updateObject() error {
 		return fmt.Errorf("cannot update an object unless the ID has been set")
 	}
 
-	// For Midpoint integration, we need to detect changes and send them via PATCH
-	if obj.apiClient.updateMethod == "PATCH" {
+	// Write debug log
+	debugFile := "/tmp/midpoint-patch-debug.log"
+	f, _ := os.OpenFile(debugFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if f != nil {
+		f.WriteString(fmt.Sprintf("\n===== updateObject called %s =====\n", time.Now().Format("2006-01-02 15:04:05")))
+		f.WriteString(fmt.Sprintf("Object ID: %s\n", obj.id))
+		f.WriteString(fmt.Sprintf("Update method: %s\n", obj.apiClient.updateMethod))
+		f.Close()
+	}
+
+	// For Midpoint integration, send the object via PATCH
+	if obj.updateMethod == "PATCH" {
+		// Write debug log
+		f, _ := os.OpenFile(debugFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if f != nil {
+			f.WriteString("Using PATCH method\n")
+			f.WriteString("Calling readObject()...\n")
+			f.Close()
+		}
+
 		// First, fetch current state to compare with desired state
 		err := obj.readObject()
 		if err != nil {
 			return fmt.Errorf("failed to read object for PATCH operation: %v", err)
+		}
+
+		// Write debug log
+		f, _ = os.OpenFile(debugFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if f != nil {
+			f.WriteString("readObject() completed successfully\n")
+			f.WriteString("Calling patchMidpointObject()...\n")
+			f.Close()
 		}
 
 		// We have apiData (current) and obj.data (desired)
@@ -422,7 +460,15 @@ func (obj *APIObject) updateObject() error {
 			log.Printf("api_object.go: Using update data '%s'", send)
 		}
 	} else {
-		b, _ := json.Marshal(obj.data)
+		// Filter ignored fields from the data before sending
+		dataToSend := obj.data
+		if len(obj.ignoreChangesTo) > 0 {
+			dataToSend = filterIgnoredFields(obj.data, obj.ignoreChangesTo)
+			if obj.debug {
+				log.Printf("api_object.go: Filtered ignored fields for UPDATE operation")
+			}
+		}
+		b, _ := json.Marshal(dataToSend)
 		send = string(b)
 	}
 
@@ -486,49 +532,145 @@ func (obj *APIObject) deleteObject() error {
 
 // patchMidpointObject calculates differences between current and desired state
 // and makes PATCH requests for each modification needed using Midpoint's ObjectModificationType format
+/*
+ * mergeIgnoredFields recursively merges ignored fields from API data into desired data.
+ * This ensures that server-managed fields are preserved during PATCH operations,
+ * even when they're nested deeply within objects.
+ */
+func mergeIgnoredFields(desired, api map[string]interface{}, ignoreList []string, debug bool) map[string]interface{} {
+	result := make(map[string]interface{})
+
+	// Start with all desired fields
+	for k, v := range desired {
+		result[k] = v
+	}
+
+	// Merge ignored fields from API
+	for key, apiValue := range api {
+		// Check if this key matches an ignore pattern at the current level
+		if matchesIgnorePattern(key, ignoreList) {
+			// Preserve this field from API
+			result[key] = apiValue
+			if debug {
+				log.Printf("api_object.go: Preserving ignored field '%s' from API state", key)
+			}
+			continue
+		}
+
+		// If this key exists in both desired and API, and both are maps, recurse
+		if desiredValue, exists := result[key]; exists {
+			desiredMap, desiredIsMap := desiredValue.(map[string]interface{})
+			apiMap, apiIsMap := apiValue.(map[string]interface{})
+
+			if desiredIsMap && apiIsMap {
+				// Descend the ignore list for this key
+				descendedIgnoreList := _descendIgnoreList(key, ignoreList)
+
+				// Recursively merge ignored fields in nested maps
+				result[key] = mergeIgnoredFields(desiredMap, apiMap, descendedIgnoreList, debug)
+			}
+		}
+	}
+
+	return result
+}
+
 func (obj *APIObject) patchMidpointObject() error {
+	// Write entry log
+	debugFile := "/tmp/midpoint-patch-debug.log"
+	f, _ := os.OpenFile(debugFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if f != nil {
+		f.WriteString(fmt.Sprintf("\n===== ENTERING patchMidpointObject %s =====\n", time.Now().Format("2006-01-02 15:04:05")))
+		f.WriteString(fmt.Sprintf("Object ID: %s\n", obj.id))
+		f.WriteString(fmt.Sprintf("Data keys: %d\n", len(obj.data)))
+		f.WriteString(fmt.Sprintf("API Data keys: %d\n", len(obj.apiData)))
+		f.Close()
+	}
+
 	if obj.debug {
 		log.Printf("api_object.go: Calculating differences for PATCH operation")
 	}
 
-	// Track if we made any changes
-	changesApplied := false
+	// For Midpoint REST API, data often has a wrapper key (e.g., {"role": {...}})
+	// When PATCH-ing to /roles/{id}, we need to patch the fields inside the role, not the wrapper itself
+	// So if there's a single top-level key, unwrap it
+	workingData := obj.data
+	workingApiData := obj.apiData
+
+	if len(obj.data) == 1 && len(obj.apiData) == 1 {
+		// Get the single key from both maps
+		var dataKey, apiKey string
+		for k := range obj.data {
+			dataKey = k
+		}
+		for k := range obj.apiData {
+			apiKey = k
+		}
+
+		// If both have the same single key and it's a map, unwrap it
+		if dataKey == apiKey {
+			if dataMap, ok := obj.data[dataKey].(map[string]interface{}); ok {
+				if apiMap, ok := obj.apiData[apiKey].(map[string]interface{}); ok {
+					workingData = dataMap
+					workingApiData = apiMap
+					if obj.debug {
+						log.Printf("api_object.go: Unwrapped data from '%s' key for patching", dataKey)
+					}
+				}
+			}
+		}
+	}
+
+	// Prepare desired data by recursively preserving ignored fields from API state
+	// This prevents ignored fields from being deleted, even when nested
+	desiredData := make(map[string]interface{})
+	for k, v := range workingData {
+		desiredData[k] = v
+	}
+
+	// Recursively merge ignored fields from API data into desired data
+	if len(obj.ignoreChangesTo) > 0 {
+		desiredData = mergeIgnoredFields(desiredData, workingApiData, obj.ignoreChangesTo, obj.debug)
+	}
 
 	// Process each top-level key in the desired state
-	for key, desiredValue := range obj.data {
-		currentValue, exists := obj.apiData[key]
+	for key, desiredValue := range desiredData {
+
+		currentValue, exists := workingApiData[key]
 
 		// Handle additions and modifications
 		if !exists {
 			// Key doesn't exist in current state - add it
-			if obj.debug {
-				log.Printf("api_object.go: Adding new attribute '%s'", key)
-			}
+			log.Printf("api_object.go: *** PATCH OPERATION: Adding new attribute '%s'", key)
 
 			err := obj.sendMidpointPatch("add", key, desiredValue)
 			if err != nil {
 				return fmt.Errorf("failed to add attribute '%s': %v", key, err)
 			}
-			changesApplied = true
 		} else if !reflect.DeepEqual(currentValue, desiredValue) {
 			// Key exists but value is different - replace it
-			if obj.debug {
-				log.Printf("api_object.go: Replacing attribute '%s'", key)
-			}
+			log.Printf("api_object.go: *** PATCH OPERATION: Replacing attribute '%s'", key)
 
 			err := obj.sendMidpointPatch("replace", key, desiredValue)
 			if err != nil {
 				return fmt.Errorf("failed to replace attribute '%s': %v", key, err)
 			}
-			changesApplied = true
 		}
 	}
 
 	// Check for deletions - keys that exist in current state but not in desired state
-	for key := range obj.apiData {
-		if _, exists := obj.data[key]; !exists {
+	for key := range workingApiData {
+		if _, exists := desiredData[key]; !exists {
 			// Skip the ID attribute - we don't want to delete that
 			if key == obj.idAttribute {
+				continue
+			}
+
+			// Skip fields in the ignore list - these are server-managed and shouldn't be deleted
+			if matchesIgnorePattern(key, obj.ignoreChangesTo) {
+				if obj.debug {
+					log.Printf("api_object.go: Skipping deletion of ignored attribute '%s'", key)
+				}
 				continue
 			}
 
@@ -540,39 +682,49 @@ func (obj *APIObject) patchMidpointObject() error {
 			if err != nil {
 				return fmt.Errorf("failed to delete attribute '%s': %v", key, err)
 			}
-			changesApplied = true
 		}
 	}
 
-	// If we didn't make any changes, read the object to ensure state is current
-	if !changesApplied {
-		if obj.debug {
-			log.Printf("api_object.go: No changes detected, refreshing state")
-		}
-		return obj.readObject()
-	}
-
+	// After sending patches, Terraform will call Read() to refresh the state
+	// So we don't need to explicitly read here
 	return nil
 }
 
 // sendMidpointPatch sends a single PATCH request for the specified modification
 func (obj *APIObject) sendMidpointPatch(modificationType string, path string, value interface{}) error {
 	// Build the ObjectModificationType payload
-	modification := make(map[string]interface{})
+	// Midpoint expects: { "objectModification": { "itemDelta": { "modificationType": "...", "path": "...", "value": ... } } }
 
-	// Structure for the itemDelta
 	itemDelta := make(map[string]interface{})
 	itemDelta["modificationType"] = modificationType
 	itemDelta["path"] = path
 
 	// Add value for add and replace operations
 	if modificationType != "delete" && value != nil {
+		// Filter out ignored fields from the value before sending
+		// This prevents sending server-managed fields like @metadata, @ns, etc.
+		if mapValue, ok := value.(map[string]interface{}); ok {
+			value = filterIgnoredFields(mapValue, obj.ignoreChangesTo)
+		} else if sliceValue, ok := value.([]interface{}); ok {
+			// Handle arrays by filtering each element
+			filteredSlice := make([]interface{}, len(sliceValue))
+			for i, elem := range sliceValue {
+				if mapElem, ok := elem.(map[string]interface{}); ok {
+					filteredSlice[i] = filterIgnoredFields(mapElem, obj.ignoreChangesTo)
+				} else {
+					filteredSlice[i] = elem
+				}
+			}
+			value = filteredSlice
+		}
 		itemDelta["value"] = value
 	}
 
-	// Complete the structure
-	modification["objectModification"] = map[string]interface{}{
-		"itemDelta": itemDelta,
+	// Wrap in objectModification as required by Midpoint's ObjectModificationType
+	modification := map[string]interface{}{
+		"objectModification": map[string]interface{}{
+			"itemDelta": itemDelta,
+		},
 	}
 
 	// Convert to JSON
@@ -581,18 +733,35 @@ func (obj *APIObject) sendMidpointPatch(modificationType string, path string, va
 		return fmt.Errorf("failed to marshal modification to JSON: %v", err)
 	}
 
-	if obj.debug {
-		log.Printf("api_object.go: Sending PATCH with payload: %s", string(modificationJSON))
+	// Construct the PATCH path
+	// NOTE: We don't include query_string for PATCH operations because options like
+	// "isImport", "overwrite", "noFetch" are for create/import operations and cause
+	// Midpoint to expect a full object (e.g., RoleType) instead of ObjectModificationType
+	patchPath := obj.putPath
+	fullPath := strings.Replace(patchPath, "{id}", obj.id, -1)
+
+	// Write debug info to file for inspection
+	debugFile := "/tmp/midpoint-patch-debug.log"
+	f, _ := os.OpenFile(debugFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if f != nil {
+		f.WriteString(fmt.Sprintf("\n===== PATCH REQUEST %s =====\n", time.Now().Format("2006-01-02 15:04:05")))
+		f.WriteString(fmt.Sprintf("Method: PATCH\n"))
+		f.WriteString(fmt.Sprintf("Full URL: %s%s\n", obj.apiClient.uri, fullPath))
+		f.WriteString(fmt.Sprintf("Payload: %s\n", string(modificationJSON)))
+		f.WriteString("================================\n")
+		f.Close()
 	}
 
-	// Construct the PATCH path
-	patchPath := obj.putPath // reuse the PUT path
-	if obj.queryString != "" {
-		patchPath = fmt.Sprintf("%s?%s", patchPath, obj.queryString)
+	if obj.debug {
+		log.Printf("api_object.go: ===== PATCH REQUEST DEBUG =====")
+		log.Printf("api_object.go: Method: PATCH")
+		log.Printf("api_object.go: Full URL: %s%s", obj.apiClient.uri, fullPath)
+		log.Printf("api_object.go: Payload: %s", string(modificationJSON))
+		log.Printf("api_object.go: ================================")
 	}
 
 	// Send the PATCH request
-	resultString, err := obj.apiClient.sendRequest("PATCH", strings.Replace(patchPath, "{id}", obj.id, -1), string(modificationJSON))
+	resultString, err := obj.apiClient.sendRequest("PATCH", fullPath, string(modificationJSON))
 	if err != nil {
 		return err
 	}

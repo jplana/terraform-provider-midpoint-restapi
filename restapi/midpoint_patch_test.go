@@ -115,6 +115,7 @@ func (svr *midpointFakeServer) handleAPIObject(w http.ResponseWriter, r *http.Re
 	
 	if r.Method == "PATCH" && len(b) > 0 {
 		// Handle Midpoint PATCH request with ObjectModificationType
+		// Format: { "objectModification": { "itemDelta": { "modificationType": "...", "path": "...", "value": ... } } }
 		var patchRequest map[string]interface{}
 		err := json.Unmarshal(b, &patchRequest)
 		if err != nil {
@@ -122,14 +123,15 @@ func (svr *midpointFakeServer) handleAPIObject(w http.ResponseWriter, r *http.Re
 			http.Error(w, "Invalid JSON in patch request", http.StatusBadRequest)
 			return
 		}
-		
-		// Navigate to objectModification.itemDelta in the request
+
+		// Extract objectModification
 		objectMod, ok := patchRequest["objectModification"].(map[string]interface{})
 		if !ok {
 			http.Error(w, "Missing objectModification in request", http.StatusBadRequest)
 			return
 		}
-		
+
+		// Extract itemDelta object
 		itemDelta, ok := objectMod["itemDelta"].(map[string]interface{})
 		if !ok {
 			http.Error(w, "Missing itemDelta in request", http.StatusBadRequest)
@@ -312,7 +314,7 @@ func TestMidpointPatchIntegration(t *testing.T) {
 		if !ok {
 			t.Fatalf("midpoint_patch_test.go: Missing objectModification in PATCH request")
 		}
-		
+
 		itemDelta, ok := objectMod["itemDelta"].(map[string]interface{})
 		if !ok {
 			t.Fatalf("midpoint_patch_test.go: Missing itemDelta in PATCH request")
@@ -367,7 +369,7 @@ func TestMidpointPatchIntegration(t *testing.T) {
 		if !ok {
 			t.Fatalf("midpoint_patch_test.go: Missing objectModification in PATCH request")
 		}
-		
+
 		itemDelta, ok := objectMod["itemDelta"].(map[string]interface{})
 		if !ok {
 			t.Fatalf("midpoint_patch_test.go: Missing itemDelta in PATCH request")
@@ -419,7 +421,7 @@ func TestMidpointPatchIntegration(t *testing.T) {
 		if !ok {
 			t.Fatalf("midpoint_patch_test.go: Missing objectModification in PATCH request")
 		}
-		
+
 		itemDelta, ok := objectMod["itemDelta"].(map[string]interface{})
 		if !ok {
 			t.Fatalf("midpoint_patch_test.go: Missing itemDelta in PATCH request")
